@@ -5,7 +5,6 @@
 This document describes the implementation of MSI v1 token revocation and client capabilities in the Microsoft Authentication Library (MSAL) for various languages. 
 
 **Key Concepts:**
-- **Token Revocation**: Enables invalidation of previously issued tokens, enhancing security
 - **Client Capabilities**: Allows clients to indicate support for features like Continuous Access Evaluation (CAE)
 - **Claims Challenge**: A mechanism used by Resource Providers to request token refresh
 - **SHA256 Token Hashing**: Used to identify revoked tokens without transmitting the original token

@@ -280,7 +280,18 @@ class ManagedIdentityClient(object):
             and then a *claims challenge* will be returned by the target resource,
             as a `claims_challenge` directive in the `www-authenticate` header,
             even if the app developer did not opt in for the "CP1" client capability.
-            Upon receiving a `claims_challenge`, MSAL will attempt to acquire a new token.
+            
+            Upon receiving a `claims_challenge`, MSAL will:
+            
+            1. Look for a token in the cache that matches the resource
+            2. If a matching token is found, compute its SHA256 hash
+            3. Include the hash in the request to the token provider as `token_sha256_to_refresh`
+            4. Include client capabilities in the request as `xms_cc` (if configured)
+            5. Attempt to acquire a new token
+            
+            This implements the Continuous Access Evaluation (CAE) protocol for token revocation
+            scenarios. For more information, see the
+            `CAE documentation <https://learn.microsoft.com/en-us/entra/identity-platform/app-resilience-continuous-access-evaluation?tabs=dotnet>`_.
 
         .. note::
 
@@ -339,8 +350,15 @@ class ManagedIdentityClient(object):
             )
             if "access_token" in result:
                 expires_in = result.get("expires_in", 3600)
-                if "refresh_in" not in result and expires_in >= 7200:
-                    result["refresh_in"] = int(expires_in / 2)
+                # Ensure expires_in is an integer before comparison
+                try:
+                    expires_in_int = int(expires_in) if not isinstance(expires_in, (int, float)) else expires_in
+                    if "refresh_in" not in result and expires_in_int >= 7200:
+                        # Store refresh_in as a string in the result dictionary
+                        result["refresh_in"] = str(int(expires_in_int / 2))
+                except (ValueError, TypeError):
+                    # If expires_in cannot be converted to int, skip setting refresh_in
+                    pass
                 self._token_cache.add(dict(
                     client_id=client_id_in_cache,
                     scope=[resource],
@@ -351,7 +369,15 @@ class ManagedIdentityClient(object):
                     data={},
                 ))
                 if "refresh_in" in result:
-                    result["refresh_on"] = int(now + result["refresh_in"])
+                    # Ensure refresh_in is an integer before adding to now
+                    try:
+                        # Get refresh_in as numeric value
+                        refresh_in_val = int(result["refresh_in"]) if not isinstance(result["refresh_in"], (int, float)) else float(result["refresh_in"])
+                        # Store refresh_on as string
+                        result["refresh_on"] = str(int(now + refresh_in_val))
+                    except (ValueError, TypeError):
+                        # If refresh_in cannot be converted to int, skip setting refresh_on
+                        pass
                 result[self._TOKEN_SOURCE] = self._TOKEN_SOURCE_IDP
             if (result and "error" not in result) or (not access_token_from_cache):
                 return result
@@ -442,6 +468,8 @@ def _obtain_token(
             os.environ["IDENTITY_HEADER"],
             managed_identity,
             resource,
+            access_token_sha256_to_refresh=access_token_sha256_to_refresh,
+            client_capabilities=client_capabilities,
         )
     if "MSI_ENDPOINT" in os.environ and "MSI_SECRET" in os.environ:
         # Back ported from https://github.com/Azure/azure-sdk-for-python/blob/azure-identity_1.15.0/sdk/identity/azure-identity/azure/identity/_credentials/azure_ml.py
@@ -502,6 +530,9 @@ def _obtain_token_on_azure_vm(http_client, managed_identity, resource):
 
 def _obtain_token_on_app_service(
     http_client, endpoint, identity_header, managed_identity, resource,
+    *,
+    access_token_sha256_to_refresh: Optional[str] = None,
+    client_capabilities: Optional[List[str]] = None,
 ):
     """Obtains token for
     `App Service <https://learn.microsoft.com/en-us/azure/app-service/overview-managed-identity?tabs=portal%2Chttp#rest-endpoint-reference>`_,
@@ -515,6 +546,15 @@ def _obtain_token_on_app_service(
         "api-version": "2019-08-01",
         "resource": resource,
         }
+    
+    # Add client capabilities if provided - needed for token revocation protocol
+    if client_capabilities:
+        params["xms_cc"] = ",".join(client_capabilities)
+    
+    # Add token hash for revocation if provided
+    if access_token_sha256_to_refresh:
+        params["token_sha256_to_refresh"] = access_token_sha256_to_refresh
+        
     _adjust_param(params, managed_identity, types_mapping={
         ManagedIdentity.CLIENT_ID: "client_id",
         ManagedIdentity.RESOURCE_ID: "mi_res_id",  # App Service's resource id uses "mi_res_id"
@@ -586,7 +626,7 @@ def _obtain_token_on_machine_learning(
 def _obtain_token_on_service_fabric(
     http_client, endpoint, identity_header, server_thumbprint, resource,
     *,
-    access_token_sha256_to_refresh: str = None,
+    access_token_sha256_to_refresh: Optional[str] = None,
     client_capabilities: Optional[List[str]] = None,
 ):
     """Obtains token for
